@@ -8,45 +8,37 @@
 import Cocoa
 import KeyboardShortcuts
 import ServiceManagement
+import StoreKit
+import CoreSpotlight
+import SwiftUI
+import WidgetKit
 
+@MainActor
+class BrightIntoshAppDelegate: NSObject {
+    
+    private lazy var settingsWindowController = SettingsWindowController()
+    
+    private var statusBarMenu: StatusBarMenu?
+    private var brightnessManager: (any BrightnessManaging)?
+    private var automationManager: AutomationManager?
+    private var incompatibleAppsMonitor: IncompatibleAppsMonitor?
+    private var hdrCooldownNoticeMonitor: HDRCooldownNoticeMonitor?
+    private var supportedDevice: Bool = false
 
-class AppDelegate: NSObject, NSApplicationDelegate {
-    
-    private var overlayAvailable: Bool = false
-    
-    let settingsWindowController = SettingsWindowController()
-    
-    var statusBarMenu: StatusBarMenu?
-    var brightnessManager: BrightnessManager?
-    var automationManager: AutomationManager?
-    var supportedDevice: Bool = false
-    
-    func applicationDidFinishLaunching(_ aNotification: Notification) {
-        
-        supportedDevice = isDeviceSupported()
-        
-        if UserDefaults.standard.object(forKey: "agreementAccepted") == nil || !UserDefaults.standard.bool(forKey: "agreementAccepted") {
-            welcomeWindow()
-        }
-        
-        if !supportedDevice {
-            Settings.shared.brightIntoshOnlyOnBuiltIn = false
-        }
-        
-        brightnessManager = BrightnessManager()
-        automationManager = AutomationManager()
-        statusBarMenu = StatusBarMenu(supportedDevice: supportedDevice, automationManager: automationManager!, settingsWindowController: settingsWindowController, toggleBrightIntosh: toggleBrightIntosh)
-        
-        // Register global hotkeys
-        addKeyListeners()
-    }
-    
     @objc func increaseBrightness() {
-        Settings.shared.brightness = min(getDeviceMaxBrightness(), Settings.shared.brightness + 0.05)
+        adjustBrightness(by: 0.05)
     }
-    
+
     @objc func decreaseBrightness() {
-        Settings.shared.brightness = max(1.0, Settings.shared.brightness - 0.05)
+        adjustBrightness(by: -0.05)
+    }
+
+    private func adjustBrightness(by amount: Float) {
+        guard BrightIntoshSettings.shared.fineGrainedBrightnessControl else {
+            return
+        }
+        let brightness = BrightIntoshSettings.shared.brightness + amount
+        BrightIntoshSettings.shared.brightness = min(max(brightness, 0), 1)
     }
     
     func addKeyListeners() {
@@ -59,14 +51,23 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         KeyboardShortcuts.onKeyUp(for: .decreaseBrightness) {
             self.decreaseBrightness()
         }
+        KeyboardShortcuts.onKeyUp(for: .openSettings, action: {
+            self.showSettingsWindow()
+        })
     }
     
     @objc func toggleBrightIntosh() {
-        if !Settings.shared.brightintoshActive && !checkBatteryAutomationContradiction() {
-            return
+        Task { @MainActor in
+            if !BrightIntoshSettings.shared.brightintoshActive && !checkBatteryAutomationContradiction() {
+                return
+            }
+            
+            let active = !BrightIntoshSettings.shared.brightintoshActive
+            BrightIntoshSettings.shared.setBrightintoshActive(
+                active,
+                reason: active ? "enabled by user" : "disabled by user"
+            )
         }
-        
-        Settings.shared.brightintoshActive.toggle()
     }
     
     func welcomeWindow() {
@@ -75,6 +76,140 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         NSApp.runModal(for: controller.window!)
         UserDefaults.standard.set(true, forKey: "agreementAccepted")
     }
- 
+    
+    func showSettingsWindow() {
+        NSApplication.shared.activate(ignoringOtherApps: true)
+        self.settingsWindowController.showWindow(nil)
+    }
+
+    
+    func addSettingsToIndex() {
+        let attributeSet = CSSearchableItemAttributeSet(contentType: UTType.application)
+        attributeSet.title = NSLocalizedString("BrightIntosh Settings", comment: "")
+        attributeSet.contentDescription = "Open the settings of BrightIntosh"
+        attributeSet.thumbnailData = URL(string: "https://brightintosh.de/brightintosh_sm.png")!.dataRepresentation
+        attributeSet.alternateNames = ["BrightIntosh Settings", "BrightIntosh", "Settings", "brightness"]
+
+        let item = CSSearchableItem(uniqueIdentifier: "de.brightintosh.app.settings", domainIdentifier: "de.brightintosh.app", attributeSet: attributeSet)
+        
+        Task {
+            do {
+                try await CSSearchableIndex.default().indexSearchableItems([item])
+            } catch {
+                print("Error indexing settings")
+            }
+        }
+    }
 }
 
+extension BrightIntoshAppDelegate: NSApplicationDelegate {
+
+    func applicationProtectedDataWillBecomeUnavailable(_ notification: Notification) {
+        brightnessManager?.protectedDataWillBecomeUnavailable()
+    }
+
+    func applicationProtectedDataDidBecomeAvailable(_ notification: Notification) {
+        brightnessManager?.protectedDataDidBecomeAvailable()
+    }
+    
+    func application(
+        _ application: NSApplication,
+        continue userActivity: NSUserActivity,
+        restorationHandler: @escaping ([any NSUserActivityRestoring]) -> Void
+    ) -> Bool {
+        if userActivity.activityType == CSSearchableItemActionType,
+           let uniqueIdentifier = userActivity.userInfo?[CSSearchableItemActivityIdentifier] as? String {
+            if uniqueIdentifier == "de.brightintosh.app.settings" {
+                self.showSettingsWindow()
+                return true
+            }
+        }
+        return false
+    }
+    
+    func applicationDidFinishLaunching(_ aNotification: Notification) {
+        self.applyActivationPolicy()
+        if cliBase() {
+            exit(0);
+        }
+        
+        supportedDevice = isSetupSupported()
+
+        if UserDefaults.standard.object(forKey: "agreementAccepted") == nil || !UserDefaults.standard.bool(forKey: "agreementAccepted") {
+            welcomeWindow()
+        }
+        
+        if !supportedDevice {
+            BrightIntoshSettings.shared.brightIntoshOnlyOnBuiltIn = false
+        }
+        
+        brightnessManager = BrightnessManager()
+        SupportReportContext.brightnessManager = brightnessManager
+        automationManager = AutomationManager()
+        incompatibleAppsMonitor = IncompatibleAppsMonitor()
+        hdrCooldownNoticeMonitor = HDRCooldownNoticeMonitor()
+        statusBarMenu = StatusBarMenu(automationManager: automationManager!, settingsWindowController: settingsWindowController, toggleBrightIntosh: toggleBrightIntosh)
+        
+        // Register global hotkeys
+        addKeyListeners()
+        
+        BrightIntoshSettings.shared.addListener(setting: "brightintoshActive") {
+#if swift(>=6.2)
+            if #available(macOS 26.0, *) {
+                ControlCenter.shared.reloadControls(ofKind: brightintoshActiveControlKind)
+            }
+#endif
+            print("Brightness: \(BrightIntoshSettings.shared.brightintoshActive ? "ON" : "OFF")")
+            /* Show Settings Store Window, when user is not authorized */
+            guard !Authorizer.shared.isAllowed() else { return }
+            Task { @MainActor in
+                self.showSettingsWindow()
+            }
+        }
+        
+        BrightIntoshSettings.shared.addListener(setting: "showInDock", callback: {
+            self.applyActivationPolicy()
+        });
+        
+        Task {
+            addSettingsToIndex()
+        }
+        
+        ProcessInfo.processInfo.disableSuddenTermination()
+    }
+    
+    func applyActivationPolicy() {
+        if BrightIntoshSettings.shared.showInDock {
+            NSApp.setActivationPolicy(.regular)
+        } else {
+            NSApp.setActivationPolicy(.accessory)
+        }
+    }
+    
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows: Bool) -> Bool {
+        self.showSettingsWindow()
+        return false
+    }
+    
+    @objc func openSettings() {
+        self.showSettingsWindow()
+    }
+    
+    func applicationDockMenu(_ sender: NSApplication) -> NSMenu? {
+        let menu = NSMenu(title: "BrightIntosh")
+        
+        let settingsItem = NSMenuItem(title: String(localized: "Settings"), action: #selector(openSettings), keyEquivalent: "")
+        settingsItem.image = NSImage(systemSymbolName: "gear", accessibilityDescription: String(localized: "Settings"))
+        menu.addItem(settingsItem)
+        
+        return menu
+    }
+}
+
+@main
+struct AppWithMenuBarExtra: App {
+    @NSApplicationDelegateAdaptor private var appDelegate: BrightIntoshAppDelegate
+    @Environment(\.openSettings) private var openSettings
+
+    var body: some Scene {}
+}
